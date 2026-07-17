@@ -2,22 +2,25 @@ model_config:
   task: state_prediction
 
   glm_tokenizer_path: pretrained_models/glm-4-voice-tokenizer
+  model_name: pretrained_models/Qwen3-0.6B-expand_vocab_v2
+  llm_dim: 1024
+  lm_vocab_size: 151936
+
   enable_lora: true
   lora_r: 32
   lora_alpha: 64
 
-  model_name: pretrained_models/Qwen3-0.6B-expand_vocab_v2
-  llm_dim: 1024
-  init_ckpt_path_lora: pretrained_models/SoulX-Duplug/SoulX-Duplug-0.6B-Bilingual.pth
+  # enable_cascade_asr: false
+
+  # init_ckpt_path: 
+  # init_ckpt_path_lora: 
 
 infer_config:
   seed: 42
   device: cuda
   precision: bf16
-  max_wait_num: 8
-  max_mistake_num: 3
-  far_field_threshold: 0.02
-  developer_mode: false
+  max_wait_num: 5
+  max_mistake_num: 5
 
   input:
     chunk_size: 2560
@@ -26,6 +29,6 @@ infer_config:
     sample_rate: 16000
 
   asr:
-    model_name: paraformer
-    # model_name: sensevoice
-    # language: en
+    model_name: sensevoice
+    # model_name: paraformer
+    language: en

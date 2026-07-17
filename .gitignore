@@ -6,6 +6,7 @@ pretrain_models
 # debug
 tmp
 .vscode
+agent_space
 
 # data
 eval/benchmark

@@ -36,9 +36,9 @@ class ModelConfig:
 
     # model config
     audio_embed_dim: int = 1280
-    llm_dim: int = 2048
+    llm_dim: int = 1024
     glm_tokenizer_path: str = "pretrained_models/glm-4-voice-tokenizer"
-    model_name: str = "pretrained_models/Qwen3-1.7B-expand_vocab_v2"
+    model_name: str = "pretrained_models/Qwen3-0.6B-expand_vocab_v2"
     init_ckpt_path: str = ""
     init_ckpt_path_lora: str = ""
 
@@ -175,10 +175,9 @@ class InferConfig:
     sample_rate: int = 16000
     max_wait_num: int = 10
     max_mistake_num: int = 5
-    far_field_threshold: float = 0.02
     developer_mode: bool = False
     single_round: bool = False
-    config_path: str = "config/config.yaml"
+    config_path: str = "config/infer_config.yaml"
 
     input: dict = field(
         default_factory=lambda: {

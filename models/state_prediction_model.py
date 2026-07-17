@@ -9,9 +9,29 @@ import pytorch_lightning as pl
 import peft
 from peft import LoraConfig, get_peft_model
 
-from model.glm_4_voice.speech_tokenizer.modeling_whisper import WhisperVQEncoder
+from models.glm_4_voice.speech_tokenizer.modeling_whisper import WhisperVQEncoder
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers import WhisperFeatureExtractor
+from utils.sparkvox.utils.scheduler import WarmupAnnealSteps
+from models._train_heads import LossHead, TokenHeadsMixin
+
+
+# # from SLAM-LLM
+# class EncoderProjector(nn.Module):
+#     def __init__(self, config):
+#         super().__init__()
+#         self.audio_embed_dim = config.audio_embed_dim
+#         self.llm_dim = config.llm_dim
+#         self.linear1 = nn.Linear(self.audio_embed_dim, 2048)
+#         self.relu = nn.ReLU()
+#         self.linear2 = nn.Linear(2048, self.llm_dim)
+
+#     def forward(self, x):
+#         x = x.contiguous()  # (batch, seq_len, dim)
+#         x = self.linear1(x)
+#         x = self.relu(x)
+#         x = self.linear2(x)
+#         return x
 
 
 class EncoderProjector(nn.Module):
@@ -35,7 +55,28 @@ class EncoderProjector(nn.Module):
         return x
 
 
-class State_Prediction_Model(pl.LightningModule):
+class State_Prediction_Model(TokenHeadsMixin, pl.LightningModule):
+    # Prediction heads, in the order their weighted losses sum into the total.
+    LOSS_HEADS = (
+        LossHead("text", "label_text_ids", "text_loss_rate"),
+        LossHead("eos", "label_eos_ids", "eos_loss_rate"),
+        LossHead("idle", "label_user_idle_ids", "idle_loss_rate"),
+        LossHead("nonidle", "label_user_nonidle_ids", "nonidle_loss_rate"),
+        LossHead(
+            "user_complete", "label_user_complete_ids", "user_complete_loss_rate"
+        ),
+        LossHead(
+            "user_incomplete",
+            "label_user_incomplete_ids",
+            "user_incomplete_loss_rate",
+        ),
+        LossHead(
+            "user_backchannel",
+            "label_user_backchannel_ids",
+            "user_backchannel_loss_rate",
+        ),
+    )
+
     def __init__(self, config, **kwargs):
         super().__init__()
         self.config = config
@@ -82,7 +123,7 @@ class State_Prediction_Model(pl.LightningModule):
             checkpoint = torch.load(
                 self.model_config.init_ckpt_path,
                 map_location=torch.device("cpu"),
-                weights_only=True,
+                weights_only=False,
             )
             state_dict = (
                 checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
@@ -120,7 +161,7 @@ class State_Prediction_Model(pl.LightningModule):
                 checkpoint = torch.load(
                     self.model_config.init_ckpt_path_lora,
                     map_location=torch.device("cpu"),
-                    weights_only=True,
+                    weights_only=False,
                 )
                 state_dict = (
                     checkpoint["state_dict"]
@@ -165,13 +206,102 @@ class State_Prediction_Model(pl.LightningModule):
 
         return model_outputs
 
-    def compute_accuracy(self, pad_outputs, pad_targets, ignore_label):
-        mask = pad_targets != ignore_label
-        numerator = torch.sum(
-            pad_outputs.masked_select(mask) == pad_targets.masked_select(mask)
+    def training_step(self, batch, batch_idx):
+        input_ids = batch["input_ids"]
+        audio_masks = batch["audio_masks"]
+
+        model_outputs = self((input_ids, audio_masks, batch["label_text_ids"]))
+        x_ori = model_outputs.logits
+        preds = torch.argmax(x_ori, -1)
+
+        loss, losses, accs = self._compute_heads(x_ori, preds, batch, self.LOSS_HEADS)
+
+        self.log("train_loss", loss, prog_bar=True, logger=True, rank_zero_only=True)
+        for head in self.LOSS_HEADS:
+            self.log(
+                f"train_{head.name}_loss",
+                losses[head.name],
+                prog_bar=True,
+                logger=True,
+                rank_zero_only=True,
+            )
+            self.log(
+                f"train_{head.name}_acc",
+                accs[head.name],
+                prog_bar=True,
+                logger=True,
+                rank_zero_only=True,
+            )
+
+        return loss
+
+    def on_validation_epoch_start(self):
+        self.val_loss = []
+        self.val_accs = {head.name: [] for head in self.LOSS_HEADS}
+
+    def validation_step(self, batch, batch_idx):
+        input_ids = batch["input_ids"]
+        audio_masks = batch["audio_masks"]
+
+        model_outputs = self((input_ids, audio_masks, batch["label_text_ids"]))
+        x_ori = model_outputs.logits
+        preds = torch.argmax(x_ori, -1)
+
+        loss, _, accs = self._compute_heads(x_ori, preds, batch, self.LOSS_HEADS)
+
+        self.val_loss.append(loss)
+        for head in self.LOSS_HEADS:
+            self.val_accs[head.name].append(accs[head.name])
+
+    def on_validation_epoch_end(self):
+        avg_loss = torch.nanmean(torch.stack(self.val_loss))
+        self.log(f"val_loss", avg_loss, prog_bar=True, logger=True, sync_dist=True)
+
+        avg_accs = {
+            head.name: torch.nanmean(torch.stack(self.val_accs[head.name]))
+            for head in self.LOSS_HEADS
+        }
+
+        # Mean over heads, counting a NaN head (no targets this epoch) as 0.
+        avg_acc = sum(
+            (acc if not torch.isnan(acc) else 0) for acc in avg_accs.values()
+        ) / len(self.LOSS_HEADS)
+        self.log(f"val_acc", avg_acc, prog_bar=True, logger=True, sync_dist=True)
+
+        for head in self.LOSS_HEADS:
+            self.log(
+                f"val_acc_{head.name}",
+                avg_accs[head.name],
+                prog_bar=True,
+                logger=True,
+                sync_dist=True,
+            )
+
+    def test_step(self, batch, batch_idx):
+        pass
+
+    def configure_optimizers(self):
+        optimizer = optim.AdamW(
+            self.parameters(),
+            lr=self.train_config.learning_rate,
+            weight_decay=self.train_config.weight_decay,
+            betas=self.train_config.betas,
+            eps=self.train_config.eps,
         )
-        denominator = torch.sum(mask)
-        return numerator.float() / denominator.float()
+
+        scheduler_dict = {
+            "scheduler": WarmupAnnealSteps(
+                optimizer,
+                warmup_step=self.train_config.warmup_steps,
+                anneal_steps=[self.train_config.anneal_steps],
+                anneal_rate=self.train_config.anneal_rate,
+                final_lr=self.train_config.min_lr,
+            ),
+            "interval": "step",
+            "frequency": 1,
+        }
+
+        return {"optimizer": optimizer, "lr_scheduler": scheduler_dict}
 
     def partial_freeze_weights(self, original_vocabsize, total_vocabsize):
         self.hook_handles = []
