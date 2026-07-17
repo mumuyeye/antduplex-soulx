@@ -127,6 +127,7 @@ For benchmarking, we use the following config:
 ## 📌 TODOs
 - [x] Publish the technical report.
 - [x] Release evaluation scripts.
+- [x] Release training scripts.
 
 
 ## 🔖 Citation
