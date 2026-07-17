@@ -88,7 +88,7 @@ git lfs install
 git clone https://huggingface.co/Soul-AILab/SoulX-Duplug-0.6B pretrained_models
 ```
 
-The released checkpoint also serves as a good starting point for fine-tuning: point `init_ckpt_path_lora` (or `init_ckpt_path`) in your config to the downloaded weights and continue training on your own data (see [Training](#-training) below).
+The released checkpoint also serves as a good starting point for fine-tuning: point `init_ckpt_path_lora` (or `init_ckpt_path`) in your config to the downloaded weights and continue training on your own data (see [Training](https://github.com/Soul-AILab/SoulX-Duplug/tree/training-code#%EF%B8%8F-training) below).
 
 
 
