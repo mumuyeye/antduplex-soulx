@@ -35,9 +35,14 @@ class ModelConfig:
     assistant_interrupt_token_id: int = 151682
 
     # model config
+    audio_backend: str = "glm"
     audio_embed_dim: int = 1280
     llm_dim: int = 1024
     glm_tokenizer_path: str = "pretrained_models/glm-4-voice-tokenizer"
+    moss_tokenizer_path: str = "/root/duplex/data/openmodels/MOSS-Audio-Tokenizer"
+    moss_chunk_duration: float = 0.16
+    moss_num_quantizers: int = 32
+    moss_audio_embed_dim: int = 768
     model_name: str = "pretrained_models/Qwen3-0.6B-expand_vocab_v2"
     init_ckpt_path: str = ""
     init_ckpt_path_lora: str = ""
@@ -66,6 +71,18 @@ class ModelConfig:
     embed_only: bool = False
 
     def __post_init__(self):
+        if self.audio_backend not in {"glm", "moss"}:
+            raise ValueError(
+                f"audio_backend must be 'glm' or 'moss', got {self.audio_backend!r}."
+            )
+        if self.moss_chunk_duration != 0.16:
+            raise ValueError("MOSS integration currently requires 160 ms chunks.")
+        if self.moss_num_quantizers != 32:
+            raise ValueError("MOSS integration uses all 32 RVQ layers.")
+        if self.moss_audio_embed_dim != 768:
+            raise ValueError(
+                "MOSS all-RVQ quantized embeddings must have dimension 768."
+            )
         self.total_vocab_size = (
             self.original_vocab_size
             + self.added_audio_token_size

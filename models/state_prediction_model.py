@@ -35,9 +35,9 @@ from models._train_heads import LossHead, TokenHeadsMixin
 
 
 class EncoderProjector(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, audio_embed_dim=None):
         super().__init__()
-        self.audio_embed_dim = config.audio_embed_dim
+        self.audio_embed_dim = audio_embed_dim or config.audio_embed_dim
         self.llm_dim = config.llm_dim
         self.linear1 = nn.Linear(self.audio_embed_dim, 2048)
         self.relu1 = nn.ReLU()
@@ -91,17 +91,31 @@ class State_Prediction_Model(TokenHeadsMixin, pl.LightningModule):
         self.token_samples = int(0.08 * self.sampling_rate)
         self._resample_buffer: dict[int, torchaudio.transforms.Resample] = {}
 
-        self.glm_tokenizer = WhisperVQEncoder.from_pretrained(
-            config.model_config.glm_tokenizer_path
-        )
-        for name, param in self.glm_tokenizer.named_parameters():
-            param.requires_grad = False
-        self.glm_tokenizer.eval()
+        self.audio_backend = self.model_config.audio_backend
+        if self.audio_backend == "glm":
+            self.glm_tokenizer = WhisperVQEncoder.from_pretrained(
+                config.model_config.glm_tokenizer_path
+            )
+            for param in self.glm_tokenizer.parameters():
+                param.requires_grad = False
+            self.glm_tokenizer.eval()
+            projector_input_dim = self.model_config.audio_embed_dim
+        elif self.audio_backend == "moss":
+            # MOSS is an external, frozen preprocessing component. Keeping it
+            # out of this module excludes it from optimizers and checkpoints.
+            self.glm_tokenizer = None
+            projector_input_dim = self.model_config.moss_audio_embed_dim
+        else:
+            raise ValueError(
+                f"Unsupported audio_backend={self.audio_backend!r}; use 'glm' or 'moss'."
+            )
 
         if self.model_config.enable_projector:
             if self.global_rank == 0:
                 print(f"setting up audio projector...")
-            self.audio_projector = EncoderProjector(self.model_config)
+            self.audio_projector = EncoderProjector(
+                self.model_config, audio_embed_dim=projector_input_dim
+            )
             if self.model_config.freeze_projector:
                 if self.global_rank == 0:
                     print(f"freeze audio projector...")
@@ -110,6 +124,8 @@ class State_Prediction_Model(TokenHeadsMixin, pl.LightningModule):
                 self.audio_projector.eval()
         else:
             self.audio_projector = None
+            if self.audio_backend == "moss":
+                raise ValueError("The MOSS backend requires enable_projector=true.")
 
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_config.model_name)
         self.llm = AutoModelForCausalLM.from_pretrained(config.model_config.model_name)
@@ -184,21 +200,34 @@ class State_Prediction_Model(TokenHeadsMixin, pl.LightningModule):
             self.embed_tokens_func = self.llm.model.model.model.embed_tokens
 
     def forward(self, batch):
-        sequences, audio_masks, labels = batch
+        if len(batch) == 3:
+            sequences, audio_masks, labels = batch
+            moss_audio_embeddings = None
+        elif len(batch) == 4:
+            sequences, audio_masks, labels, moss_audio_embeddings = batch
+        else:
+            raise ValueError("forward expects (ids, mask, labels[, MOSS embeddings]).")
 
         if self.audio_projector:
-            audio_tokens = sequences.clone()
-            audio_tokens[audio_masks] -= self.model_config.added_audio_token_start
-            audio_tokens[~audio_masks] = 0
-            audio_embeds = self.glm_tokenizer.codebook(audio_tokens)
-            audio_embeds = self.audio_projector(audio_embeds)
+            text_ids = sequences.masked_fill(audio_masks, 0)
+            text_embeds = self.embed_tokens_func(text_ids)
 
-            sequences[audio_masks] = 0
-
-            text_embeds = self.embed_tokens_func(sequences)
-
-            audio_masks = audio_masks.unsqueeze(-1)
-            inputs_embeds = audio_embeds * audio_masks + text_embeds * (~audio_masks)
+            if self.audio_backend == "glm":
+                if moss_audio_embeddings is not None:
+                    raise ValueError("GLM backend does not accept MOSS embeddings.")
+                audio_tokens = sequences.clone()
+                audio_tokens[audio_masks] -= self.model_config.added_audio_token_start
+                audio_tokens[~audio_masks] = 0
+                audio_embeds = self.glm_tokenizer.codebook(audio_tokens)
+                audio_embeds = self.audio_projector(audio_embeds)
+                expanded_mask = audio_masks.unsqueeze(-1)
+                inputs_embeds = audio_embeds * expanded_mask + text_embeds * (
+                    ~expanded_mask
+                )
+            else:
+                inputs_embeds = self._merge_moss_embeddings(
+                    text_embeds, audio_masks, moss_audio_embeddings
+                )
 
             model_outputs = self.llm(inputs_embeds=inputs_embeds, labels=labels)
         else:
@@ -206,11 +235,48 @@ class State_Prediction_Model(TokenHeadsMixin, pl.LightningModule):
 
         return model_outputs
 
+    def _merge_moss_embeddings(self, text_embeds, audio_masks, moss_audio_embeddings):
+        if moss_audio_embeddings is None:
+            raise ValueError(
+                "MOSS backend requires compact moss_audio_embeddings [B, T_audio, 768]."
+            )
+        if moss_audio_embeddings.ndim != 3:
+            raise ValueError(
+                "moss_audio_embeddings must have shape [B, T_audio, 768]; "
+                f"got {tuple(moss_audio_embeddings.shape)}."
+            )
+        batch_size, available_frames, embed_dim = moss_audio_embeddings.shape
+        if batch_size != text_embeds.shape[0] or embed_dim != 768:
+            raise ValueError(
+                "MOSS embedding shape mismatch: expected batch "
+                f"{text_embeds.shape[0]} and dim 768, got {tuple(moss_audio_embeddings.shape)}."
+            )
+
+        frame_counts = audio_masks.sum(dim=1)
+        if torch.any(frame_counts > available_frames):
+            raise ValueError(
+                "Each sample needs at least as many MOSS frames as audio-mask positions; "
+                f"mask counts={frame_counts.tolist()}, available={available_frames}."
+            )
+
+        projected = self.audio_projector(
+            moss_audio_embeddings.to(device=text_embeds.device, dtype=text_embeds.dtype)
+        )
+        inputs_embeds = text_embeds.clone()
+        for batch_index, frame_count in enumerate(frame_counts.tolist()):
+            inputs_embeds[batch_index, audio_masks[batch_index]] = projected[
+                batch_index, :frame_count
+            ]
+        return inputs_embeds
+
     def training_step(self, batch, batch_idx):
         input_ids = batch["input_ids"]
         audio_masks = batch["audio_masks"]
 
-        model_outputs = self((input_ids, audio_masks, batch["label_text_ids"]))
+        model_inputs = (input_ids, audio_masks, batch["label_text_ids"])
+        if self.audio_backend == "moss":
+            model_inputs += (batch.get("moss_audio_embeddings"),)
+        model_outputs = self(model_inputs)
         x_ori = model_outputs.logits
         preds = torch.argmax(x_ori, -1)
 
@@ -243,7 +309,10 @@ class State_Prediction_Model(TokenHeadsMixin, pl.LightningModule):
         input_ids = batch["input_ids"]
         audio_masks = batch["audio_masks"]
 
-        model_outputs = self((input_ids, audio_masks, batch["label_text_ids"]))
+        model_inputs = (input_ids, audio_masks, batch["label_text_ids"])
+        if self.audio_backend == "moss":
+            model_inputs += (batch.get("moss_audio_embeddings"),)
+        model_outputs = self(model_inputs)
         x_ori = model_outputs.logits
         preds = torch.argmax(x_ori, -1)
 

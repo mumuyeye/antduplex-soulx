@@ -1,6 +1,10 @@
 model_config: 
   task: state_prediction
+  audio_backend: glm
   glm_tokenizer_path: pretrained_models/glm-4-voice-tokenizer
+  moss_tokenizer_path: /root/duplex/data/openmodels/MOSS-Audio-Tokenizer
+  moss_chunk_duration: 0.16
+  moss_num_quantizers: 32
   model_name: pretrained_models/Qwen3-0.6B-expand_vocab_v2
   llm_dim: 1024
   lm_vocab_size: 151936
