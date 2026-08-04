@@ -1,10 +1,9 @@
 <div align="center">
     <h1>
-    SoulX-Duplug
+    AntDuplex-SoulX
     </h1>
     <p>
-    Official code for enabling full-duplex speech interaction with<br>
-    <b><em>SoulX-Duplug: Plug-and-Play Streaming State Prediction Module for Realtime Full-Duplex Speech Conversation</em></b>
+    Ant 项目基于 SoulX-Duplug 演进的实时全双工语音模型
     </p>
     <p>
     <img src="assets/SoulX-Duplug-logo.png" alt="SoulX-Duplug Logo" style="width: 200px; height: 200px;">
@@ -19,6 +18,11 @@
     <a href="https://huggingface.co/datasets/Soul-AILab/SoulX-Duplug-Eval"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Eval-yellow" alt="HF-Eval"></a>
     <a href="https://github.com/Soul-AILab/SoulX-Duplug"><img src="https://img.shields.io/badge/License-Apache%202.0-green.svg" alt="Apache-2.0"></a>
 </div>
+
+> **Project note:** AntDuplex-SoulX is an Ant project forked from
+> [SoulX-Duplug](https://github.com/Soul-AILab/SoulX-Duplug). We preserve the
+> upstream model names and interfaces for compatibility while developing an
+> independent AntDuplex integration on top.
 
 
 ## ✨ Overview
@@ -53,8 +57,8 @@ Here are instructions for installing on Linux.
 
 - Clone the repo
 ```bash
-git clone https://github.com/Soul-AILab/SoulX-Duplug.git
-cd SoulX-Duplug
+git clone https://github.com/mumuyeye/antduplex-soulx.git
+cd antduplex-soulx
 ```
 
 - Install system dependencies
