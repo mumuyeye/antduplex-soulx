@@ -39,5 +39,27 @@ from 768 to 1,024 and scatters them into positions selected by `audio_masks`.
 The adapter is deliberately external to the Lightning module, so its frozen
 weights are not added to the optimizer or training checkpoints.
 
-The current Fisher example data contains only precomputed GLM audio-token IDs,
-not waveforms. Producing a real MOSS training dataset is a separate data step.
+## Offline training data
+
+Training stores the official quantized embeddings instead of running MOSS in
+the training process. The input dataset must contain `index`, `sequence`,
+`wav` (mono float32 bytes) and `sample_rate`:
+
+```bash
+python scripts/preprocess_moss.py \
+  --input data/source \
+  --output data/moss \
+  --moss-model-path /root/duplex/data/openmodels/MOSS-Audio-Tokenizer \
+  --devices 3,4 \
+  --workers-per-device 1
+```
+
+Each worker owns one official MOSS model and writes one Parquet shard. Increase
+`--workers-per-device` only when the GPU has enough memory for another model
+copy. The output stores float16 `[T, 768]` embeddings as compact binary together
+with `moss_num_frames`; the dataset restores the shape before padding. All GLM
+`<|audio_N|>` values are changed to `<|audio_0|>` position markers, and
+preprocessing fails if their count does not exactly equal the MOSS frame count.
+
+The included Fisher example has no waveform and therefore cannot itself be
+preprocessed.

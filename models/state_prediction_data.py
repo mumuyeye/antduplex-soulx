@@ -1,9 +1,10 @@
 import pytorch_lightning as pl
-import torch, torchaudio
 import numpy as np
-from torch.utils.data import DataLoader, DistributedSampler
-from datasets import load_dataset, load_from_disk
-from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+import torchaudio
+from torch.utils.data import DataLoader
+from datasets import load_dataset
+from transformers import AutoTokenizer
 from torch.nn.utils.rnn import pad_sequence
 
 
@@ -93,6 +94,41 @@ class State_Prediction_Dataset(torch.utils.data.Dataset):
         index = data_dict["index"]
 
         full_token = torch.tensor(self.tokenizer.encode(sequence))
+        moss_audio_embeddings = None
+        if self.model_config.audio_backend == "moss":
+            if "moss_audio_embeddings" not in data_dict:
+                raise ValueError(f"{index}: MOSS data requires moss_audio_embeddings")
+            stored_embeddings = data_dict["moss_audio_embeddings"]
+            if isinstance(stored_embeddings, (bytes, bytearray, memoryview)):
+                num_frames = int(data_dict["moss_num_frames"])
+                expected_bytes = num_frames * 768 * 2
+                if len(stored_embeddings) != expected_bytes:
+                    raise ValueError(
+                        f"{index}: expected {expected_bytes} MOSS embedding bytes, "
+                        f"got {len(stored_embeddings)}"
+                    )
+                moss_audio_embeddings = torch.from_numpy(
+                    np.frombuffer(stored_embeddings, dtype=np.float16)
+                    .copy()
+                    .reshape(num_frames, 768)
+                )
+            else:
+                moss_audio_embeddings = torch.as_tensor(
+                    stored_embeddings, dtype=torch.float16
+                )
+            if moss_audio_embeddings.ndim != 2 or moss_audio_embeddings.shape[1] != 768:
+                raise ValueError(
+                    f"{index}: expected MOSS embeddings [T, 768], "
+                    f"got {tuple(moss_audio_embeddings.shape)}"
+                )
+            full_audio_count = int(
+                (full_token >= self.added_audio_token_start).sum().item()
+            )
+            if moss_audio_embeddings.shape[0] != full_audio_count:
+                raise ValueError(
+                    f"{index}: sequence has {full_audio_count} audio positions, "
+                    f"but data has {moss_audio_embeddings.shape[0]} MOSS frames"
+                )
 
         if full_token.shape[0] > self.dataset_config.max_token_length:
             full_token = full_token[: self.dataset_config.max_token_length]
@@ -106,6 +142,8 @@ class State_Prediction_Dataset(torch.utils.data.Dataset):
         user_complete_token_mask = full_token == self.user_complete_token_id
         user_incomplete_token_mask = full_token == self.user_incomplete_token_id
         user_backchannel_token_mask = full_token == self.user_backchannel_token_id
+        if moss_audio_embeddings is not None:
+            moss_audio_embeddings = moss_audio_embeddings[: int(audio_mask.sum())]
 
         label_token_text = full_token.clone()
         label_token_eos = full_token.clone()
@@ -125,7 +163,7 @@ class State_Prediction_Dataset(torch.utils.data.Dataset):
         label_token_user_incomplete[~user_incomplete_token_mask] = self.IGNORE_INDEX
         label_token_user_backchannel[~user_backchannel_token_mask] = self.IGNORE_INDEX
 
-        return {
+        sample = {
             "index": index,
             "input_id": full_token,
             "audio_mask": audio_mask,
@@ -138,6 +176,9 @@ class State_Prediction_Dataset(torch.utils.data.Dataset):
             "label_user_incomplete": label_token_user_incomplete,
             "label_user_backchannel": label_token_user_backchannel,
         }
+        if moss_audio_embeddings is not None:
+            sample["moss_audio_embeddings"] = moss_audio_embeddings
+        return sample
 
     def collator(self, samples):
         assert samples is not None
@@ -192,7 +233,7 @@ class State_Prediction_Dataset(torch.utils.data.Dataset):
         #     [s["label"] for s in samples], padding_value=self.IGNORE_INDEX
         # ).transpose(0, 1)
 
-        return {
+        batch = {
             "switch_loss_rate": switch_loss_rate,
             "input_ids": input_ids,
             "audio_masks": audio_masks,
@@ -205,6 +246,13 @@ class State_Prediction_Dataset(torch.utils.data.Dataset):
             "label_user_incomplete_ids": label_user_incomplete_ids,
             "label_user_backchannel_ids": label_user_backchannel_ids,
         }
+        if self.model_config.audio_backend == "moss":
+            batch["moss_audio_embeddings"] = pad_sequence(
+                [s["moss_audio_embeddings"] for s in samples],
+                batch_first=True,
+                padding_value=0.0,
+            )
+        return batch
 
 
 class State_Prediction_DataModule(pl.LightningDataModule):
